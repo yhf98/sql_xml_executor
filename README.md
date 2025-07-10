@@ -1,4 +1,4 @@
-# 🧩 Custom Query Executor
+# 🧩 SQL XML Executor
 
 A lightweight dynamic SQL executor based on XML configuration files for **FastAPI** and **SQLAlchemy (Async)**.
 
