@@ -3,9 +3,8 @@
     <query id="getUserDailyGrowth">
         SELECT DATE_FORMAT(create_at, '%Y-%m-%d') AS create_date, COUNT(*) AS count
         FROM user 
-        WHERE 1=1 
         <where>
-            <if test="start_time">AND create_at &gt;= :start_time</if>
+            <if test="start_time"> create_at &gt;= :start_time</if>
             <if test="end_time">AND create_at &lt;= :end_time</if>
         </where>
         GROUP BY create_date

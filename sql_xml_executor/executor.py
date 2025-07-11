@@ -1,22 +1,29 @@
-
 import os
 import re
 import logging
-from sqlalchemy.ext.asyncio import AsyncSession
 from xml.etree import ElementTree as ET
-from typing import Dict, Any, List, Optional
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi.encoders import jsonable_encoder
 from typing import Dict, Any, List, Optional, Union
-
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+DEBUG_SQL_LOG=os.environ.get('DEBUG_SQL_LOG', True)
+
+# XML 转义符常量映射表
+XML_ENTITY_MAPPING = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&amp;": "&",
+    "&apos;": "'",
+    "&quot;": '"',
+}
+
+SENSITIVE_KEYS = {"password", "secret", "token", "key"}
 
 class SqlXmlExecutor:
     def __init__(self, db: AsyncSession, mapper_dir: str = "mapper"):
         self.db = db
-        self.queries = self.load_queries(mapper_dir)
+        self.raw_queries = self.load_queries(mapper_dir)
 
     def load_queries(self, dir_path: str) -> Dict[str, Dict[str, str]]:
         queries = {}
@@ -29,58 +36,90 @@ class SqlXmlExecutor:
                 queries[module] = {}
                 for query in root.findall('query'):
                     query_id = query.get('id')
-                    # 提取整个 <query> 标签内的完整内容（含子标签）
-                    query_text = self._get_full_query_text(query).strip()
-                    queries[module][query_id] = query_text
+                    queries[module][query_id] = ET.tostring(query, encoding='unicode')
         return queries
 
-    def _get_full_query_text(self, element):
-        """
-        递归获取元素及其所有子元素的文本内容
-        """
-        text = element.text or ""
-        for child in element:
-            text += self._get_full_query_text(child)
-        text += element.tail or ""
+    def _decode_xml_entities(self, text: str) -> str:
+        for entity, char in XML_ENTITY_MAPPING.items():
+            text = text.replace(entity, char)
         return text
 
-    def parse_xml_query(self, xml_query: str, params: dict) -> str:
-        wrapped = f"<root>{xml_query}</root>"
+    def _safe_log_params(self, params: dict) -> dict:
+        return {k: "***" if any(x in k for x in SENSITIVE_KEYS) else v for k, v in params.items()}
+
+    def _replace_placeholders(self, sql: str, replacements: Dict[str, str]) -> str:
+        for k, v in replacements.items():
+            sql = sql.replace(k, v)
+        return sql
+
+    def _get_full_query_text(self, element: ET.Element, params: dict = None) -> str:
+        if params is None:
+            params = {}
+        result = []
+
+        if element.text:
+            result.append(element.text)
+
+        for child in element:
+            tag = child.tag.lower()
+
+            if tag == "if":
+                condition = child.attrib.get("test", "")
+                if self._safe_eval_condition(condition, params):
+                    result.append(self._get_full_query_text(child, params))
+
+            elif tag == "choose":
+                matched = False
+                for when in child.findall("when"):
+                    cond = when.attrib.get("test", "")
+                    if not matched and self._safe_eval_condition(cond, params):
+                        result.append(self._get_full_query_text(when, params))
+                        matched = True
+                if not matched:
+                    otherwise = child.find("otherwise")
+                    if otherwise is not None:
+                        result.append(self._get_full_query_text(otherwise, params))
+
+            elif tag == "where":
+                inner = self._get_full_query_text(child, params).strip()
+                if inner:
+                    inner = re.sub(r'^\s*(AND|OR)\s+', '', inner, flags=re.IGNORECASE)
+                    result.append(f" WHERE {inner}")
+
+            else:
+                result.append(self._get_full_query_text(child, params))
+
+            if child.tail:
+                result.append(child.tail)
+
+        return ''.join(result)
+
+    def _safe_eval_condition(self, condition: str, params: dict) -> bool:
         try:
-            root = ET.fromstring(wrapped)
-        except ET.ParseError as e:
-            raise ValueError(f"XML 解析失败: {e}")
+            condition = condition.strip()
+            if re.match(r'^\w+$', condition) and condition in params:
+                condition = f"{condition} != None"
 
-        def process_node(node):
-            sql_parts = []
-            for child in node:
-                if child.tag == "if":
-                    condition = child.attrib["test"]
-                    if eval_condition(condition, params):
-                        content = child.text.strip() if child.text else ""
-                        sql_parts.append(content)
-                elif child.tag == "where":
-                    where_sql = process_node(child)
-                    if where_sql:
-                        sql_parts.append("WHERE " + where_sql)
-                elif child.tag == "choose":
-                    for when in child.findall("when"):
-                        cond = when.attrib["test"]
-                        if eval_condition(cond, params):
-                            content = when.text.strip() if when.text else ""
-                            sql_parts.append(content)
-                            break
-                else:
-                    inner = process_node(child)
-                    if inner:
-                        sql_parts.append(inner)
-            return "\n".join(sql_parts)
+            expr = self._substitute_variables(condition, params)
+            if not re.fullmatch(r"[\w\s!=<>'\"().+-/*]+", expr):
+                raise ValueError(f"不安全的表达式：{expr}")
+            return bool(eval(expr, {"__builtins__": {}}, {}))
+        except Exception as e:
+            logger.warning(f"条件评估失败: {condition} -> {e}")
+            return False
 
-        def eval_condition(condition: str, params: dict) -> bool:
-            return condition in params and params[condition] is not None
-
-        raw_sql = re.sub(r'\s+AND\s', '\n  AND ', process_node(root), flags=re.IGNORECASE).strip()
-        return raw_sql.replace("&gt;", ">").replace("&lt;", "<")
+    def _substitute_variables(self, expr: str, params: dict) -> str:
+        # 避免被部分匹配，先替换长变量名
+        for key in sorted(params, key=len, reverse=True):
+            value = params[key]
+            safe_key = re.escape(key)
+            if isinstance(value, str):
+                expr = re.sub(rf"\b{safe_key}\b", f"'{value}'", expr)
+            elif isinstance(value, (int, float, bool)):
+                expr = re.sub(rf"\b{safe_key}\b", str(value).lower(), expr)
+            elif value is None:
+                expr = re.sub(rf"\b{safe_key}\b", "None", expr)
+        return expr
 
     async def execute(
         self,
@@ -89,39 +128,25 @@ class SqlXmlExecutor:
         params: Optional[Dict[str, Any]] = None,
         single_row: bool = False,
         v_return_obj: bool = True,
-        schema: Any = None
+        schema: Any = None,
+        replace_params: Optional[Dict[str, str]] = None,
     ) -> Union[List[Dict], Dict, None]:
-        if module not in self.queries or query_id not in self.queries[module]:
+        
+        if module not in self.raw_queries or query_id not in self.raw_queries[module]:
             raise ValueError(f"Query ID '{query_id}' not found in module '{module}'")
 
-        raw_xml = self.queries[module][query_id]
+        raw_query_xml = self.raw_queries[module][query_id]
+        query_element = ET.fromstring(raw_query_xml)
 
-        # 如果没有 <if>、<where> 等标签，直接执行原始 SQL
-        if "<if" not in raw_xml and "<where" not in raw_xml:
-            final_sql = raw_xml.replace("&gt;", ">").replace("&lt;", "<")
-            
-            # 🔍 打印 SQL 和参数
+        final_sql = self._get_full_query_text(query_element, params or {})
+        final_sql = self._decode_xml_entities(final_sql)
+        if replace_params:
+            final_sql = self._replace_placeholders(final_sql, replace_params)
+
+        if DEBUG_SQL_LOG:
             logger.info(f"[SQL Query] Module: {module}, Query ID: {query_id}")
-            logger.info(f"Final SQL:\n{final_sql}")
-            logger.info(f"Params: {params}")
-
-            result = await self.db.execute(text(final_sql), params or {})
-            rows = result.mappings().all()
-            if not rows:
-                return None
-
-            data = [dict(row) for row in rows]
-            if v_return_obj and schema:
-                data = [schema(**item) for item in data]
-            return data[0] if single_row else data
-
-        # 否则才走 XML 动态解析逻辑（如果需要的话）
-        final_sql = self.parse_xml_query(raw_xml, params or {})
-
-        # 🔍 打印解析后的 SQL 和参数
-        logger.info(f"[SQL Query] Module: {module}, Query ID: {query_id}")
-        logger.info(f"Parsed SQL:\n{final_sql}")
-        logger.info(f"Params: {params}")
+            logger.info(f"Parsed SQL:\n{final_sql}")
+            logger.debug(f"Params: {self._safe_log_params(params or {})}")
 
         result = await self.db.execute(text(final_sql), params or {})
         rows = result.mappings().all()
@@ -132,4 +157,5 @@ class SqlXmlExecutor:
         data = [dict(row) for row in rows]
         if v_return_obj and schema:
             data = [schema(**item) for item in data]
+
         return data[0] if single_row else data

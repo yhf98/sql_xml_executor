@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="sql_xml_executor",
-    version="0.2.0",
+    version="0.3.0",
     author="Yao Hengfeng",
     author_email="yaohengfeng98@gmail.com",
     description="A dynamic SQL query executor using XML configuration for SQLAlchemy and FastAPI.",
