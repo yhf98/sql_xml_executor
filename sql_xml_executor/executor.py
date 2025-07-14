@@ -95,15 +95,24 @@ class SqlXmlExecutor:
         return ''.join(result)
 
     def _safe_eval_condition(self, condition: str, params: dict) -> bool:
+        import ast
         try:
             condition = condition.strip()
             if re.match(r'^\w+$', condition) and condition in params:
                 condition = f"{condition} != None"
 
             expr = self._substitute_variables(condition, params)
-            if not re.fullmatch(r"[\w\s!=<>'\"().+-/*]+", expr):
-                raise ValueError(f"不安全的表达式：{expr}")
-            return bool(eval(expr, {"__builtins__": {}}, {}))
+
+            # 安全地解析 AST 表达式
+            expr_ast = ast.parse(expr, mode='eval')
+            for node in ast.walk(expr_ast):
+                if not isinstance(node, (ast.Expression, ast.Name, ast.Load, ast.BinOp,
+                                        ast.UnaryOp, ast.BoolOp, ast.Compare,
+                                        ast.And, ast.Or, ast.Eq, ast.NotEq,
+                                        ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+                                        ast.Is, ast.IsNot, ast.Constant, ast.Str, ast.Num)):
+                    raise ValueError(f"不安全表达式：{expr}")
+            return eval(expr, {"__builtins__": {}}, {})
         except Exception as e:
             logger.warning(f"条件评估失败: {condition} -> {e}")
             return False
